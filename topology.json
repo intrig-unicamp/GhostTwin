@@ -1,0 +1,35 @@
+{
+    "switches": [
+        "s1",
+        "s2"
+    ],
+    "links": [
+        {
+            "src": "s1",
+            "dst": "s2",
+            "type": "SF",
+            "bandwidth": 10000,
+            "latency": 0,
+            "jitter": 0,
+            "packet_loss": 0
+        },
+        {
+            "src": "s1",
+            "dst": "p0",
+            "type": "physical",
+            "bandwidth": null,
+            "latency": null,
+            "jitter": null,
+            "packet_loss": null
+        },
+        {
+            "src": "s2",
+            "dst": "p1",
+            "type": "physical",
+            "bandwidth": null,
+            "latency": null,
+            "jitter": null,
+            "packet_loss": null
+        }
+    ]
+}
