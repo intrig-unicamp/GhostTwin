@@ -48,94 +48,311 @@ DOCA_LOG_REGISTER(FLOW_RSS_META);
 
 #define MAX_FLOW 1000
 #define MAX_SERVICES 10
-static uint64_t bytes_accumulated = 0;
-static uint64_t bandwidth;  // 
-static int  packet_loss;
-static int latency;  // in ms
-static int jitter; // the maximum value of jitter
 
-static struct timespec last_time = {0};
+/*                  THREADING                        */
 
 pthread_t topology_thread;
 volatile int topology_thread_running = 1;
 pthread_mutex_t topology_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+
+/*                  BANDWIDTH                        */
+
+/*			BANDWIDTH				*/
+uint64_t bandwidth;
+uint64_t bandwidth_bytes_per_sec = 0;
+static uint64_t bytes_sent_in_current_window = 0;
+static struct timespec window_start_time = {0};
+static int bandwidth_initialized = 0;
+
+// Window size in milliseconds - smaller = smoother but more overhead
+#define RATE_LIMIT_WINDOW_MS 100  // 100ms windows
+
+// Initialize bandwidth limiter (input in MB/s)
+void init_working_bandwidth_limiter(uint64_t bandwidth_mbps) {
+    bandwidth_bytes_per_sec = bandwidth_mbps * 1024 * 1024 / 8;  // Convert MB/s to bits/s
+    bytes_sent_in_current_window = 0;
+    clock_gettime(CLOCK_MONOTONIC, &window_start_time);
+    bandwidth_initialized = 1;
+    
+    printf("Bandwidth limiter initialized: %lu MB/s = %lu bytes/s\n", 
+           bandwidth_mbps, bandwidth_bytes_per_sec);
+}
+
+void update_bandwidth_bytes_per_sec(uint64_t bandwidth_mbps){
+    bandwidth_bytes_per_sec = bandwidth_mbps * 1024 * 1024 / 8;  // Convert MB/s to bits/s
+}
+
+// Check and update bandwidth limiting
+int process_bandwidth_limit(uint16_t packet_size) {
+    if (bandwidth_bytes_per_sec == 0) return 1; // No limit
+    
+    if (!bandwidth_initialized) {
+        printf("ERROR: Bandwidth limiter not initialized!\n");
+        return 1;
+    }
+    
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    
+    // Calculate elapsed time in milliseconds
+    double elapsed_ms = ((now.tv_sec - window_start_time.tv_sec) * 1000.0) + 
+                       ((now.tv_nsec - window_start_time.tv_nsec) / 1000000.0);
+    
+    // Reset window when time threshold reached
+    if (elapsed_ms >= RATE_LIMIT_WINDOW_MS) {
+        bytes_sent_in_current_window = 0;
+        window_start_time = now;
+        elapsed_ms = 0;
+    }
+    
+    // Calculate how many bytes we can send in this window
+    uint64_t bytes_allowed_in_window = (bandwidth_bytes_per_sec * RATE_LIMIT_WINDOW_MS) / 1000;
+    
+    // Check if sending this packet would exceed the window limit
+    if (bytes_sent_in_current_window + packet_size <= bytes_allowed_in_window) {
+        bytes_sent_in_current_window += packet_size;
+        return 1; // Can send
+    }
+    
+    return 0; // Would exceed limit
+}
+
+
+/*                 LATENCY/JITTER                       */
+
+struct delayed_packet {
+    struct rte_mbuf *pkt;
+    struct timespec send_time;
+};
+
+int latency;  // in ms
+int jitter; // the maximum value of jitter
+
+#define MAX_DELAYED_PACKETS 4096
+static struct delayed_packet delay_queue[MAX_DELAYED_PACKETS];
+static int delay_queue_head = 0;
+static int delay_queue_tail = 0;
+
+struct flow_jitter_state {
+	uint64_t flow_id;     // hash key for the flow
+	int jitter_offset_ms; // current offset for correlated jitter
+};
+
+static struct rte_hash *flow_table = NULL;
+
+void init_flow_table(void) {
+    struct rte_hash_parameters hash_params = {
+        .name = "flow_table",
+        .entries = 1024,   // adjust for number of flows
+        .key_len = sizeof(uint64_t),
+        .hash_func = rte_jhash,
+        .hash_func_init_val = 0,
+    };
+
+    flow_table = rte_hash_create(&hash_params);
+    if (flow_table == NULL) {
+        rte_exit(EXIT_FAILURE, "Unable to create flow table\n");
+    }
+}
+
+void update_latency_and_jitter(int new_latency, int new_jitter) {
+    // Update global latency value
+    latency = new_latency;
+    jitter = new_jitter;
+    
+    // Clear all existing flow jitter states since jitter range changed
+    if (flow_table != NULL) {
+
+        const void *key;
+        void *data;
+        uint32_t iter = 0;
+        
+        // Iterate through all existing flows
+        while (rte_hash_iterate(flow_table, &key, &data, &iter) >= 0) {
+            struct flow_jitter_state *state = (struct flow_jitter_state *)data;
+            if (state != NULL) {
+                // Reset jitter offset for this flow with new range
+                state->jitter_offset_ms = (rand() % (2 * new_jitter + 1)) - new_jitter;
+            }
+        }
+    }
+}
+
+
+uint64_t get_flow_id(struct rte_mbuf *pkt) {
+	struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+	if (eth->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))
+		return 0; // non-IPv4 flows get ID=0
+
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
+	uint32_t src = rte_be_to_cpu_32(ip->src_addr);
+	uint32_t dst = rte_be_to_cpu_32(ip->dst_addr);
+
+	uint16_t src_port = 0, dst_port = 0;
+	if (ip->next_proto_id == IPPROTO_UDP || ip->next_proto_id == IPPROTO_TCP) {
+		struct rte_udp_hdr *l4 = (struct rte_udp_hdr *)((unsigned char *)ip + (ip->ihl * 4));
+		src_port = rte_be_to_cpu_16(l4->src_port);
+		dst_port = rte_be_to_cpu_16(l4->dst_port);
+	}
+
+	uint64_t key = ((uint64_t)src << 32) ^ dst ^ ((uint64_t)src_port << 16) ^ dst_port ^ ip->next_proto_id;
+	return key;
+}
+
+
+/**
+ * Compute the per-flow delay including latency + jitter
+ *
+ * @flow_id: unique 64-bit key for the flow
+ * @base_latency: base latency in milliseconds
+ * @jitter_range: maximum jitter in ms (will vary ±jitter_range)
+ * @return: total delay in ms
+ */
+int compute_per_flow_delay(uint64_t flow_id, int base_latency, int jitter_range) {
+    struct flow_jitter_state *state = NULL;
+
+    // Lookup flow in hash table
+    int ret = rte_hash_lookup_data(flow_table, &flow_id, (void **)&state);
+    if (ret < 0) {
+        // New flow → allocate and insert into hash table
+        state = malloc(sizeof(*state));
+        if (!state) {
+            // Memory allocation failed; fallback to base latency
+            return base_latency;
+        }
+        state->flow_id = flow_id;
+        state->jitter_offset_ms = (rand() % (2 * jitter_range + 1)) - jitter_range;
+        
+        ret = rte_hash_add_key_data(flow_table, &flow_id, state);
+        if (ret < 0) {
+            // Failed to insert; free memory and fallback
+            free(state);
+            return base_latency;
+        }
+    } else {
+        // Existing flow → update offset gradually using EMA
+        int sample = (rand() % (2 * jitter_range + 1)) - jitter_range;
+        double alpha = 0.9; // smoothing factor (0.0 = rapid change, 1.0 = no change)
+        state->jitter_offset_ms = (int)(alpha * state->jitter_offset_ms + (1.0 - alpha) * sample);
+    }
+
+    int delay_ms = base_latency + state->jitter_offset_ms;
+    if (delay_ms < 0) delay_ms = 0; // avoid negative delays
+
+    return delay_ms;
+}
+
+void enqueue_with_delay(struct rte_mbuf *pkt) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    uint64_t flow_id = get_flow_id(pkt);
+    int delay_ms = compute_per_flow_delay(flow_id, latency, jitter);
+
+    struct timespec send_time = now;
+    send_time.tv_sec += delay_ms / 1000;
+    send_time.tv_nsec += (delay_ms % 1000) * 1000000L;
+    if (send_time.tv_nsec >= 1000000000L) {
+        send_time.tv_sec++;
+        send_time.tv_nsec -= 1000000000L;
+    }
+
+    delay_queue[delay_queue_tail].pkt = pkt;
+    delay_queue[delay_queue_tail].send_time = send_time;
+    delay_queue_tail = (delay_queue_tail + 1) % MAX_DELAYED_PACKETS;
+}
+
+void flush_ready_packets(uint16_t egress_port) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    struct rte_mbuf *to_forward[PACKET_BURST];
+    int forward_count = 0;
+
+    while (delay_queue_head != delay_queue_tail) {
+        struct delayed_packet *dp = &delay_queue[delay_queue_head];
+        if ((dp->send_time.tv_sec < now.tv_sec) ||
+            (dp->send_time.tv_sec == now.tv_sec && dp->send_time.tv_nsec <= now.tv_nsec)) {
+            // Ready to send
+            to_forward[forward_count++] = dp->pkt;
+            delay_queue_head = (delay_queue_head + 1) % MAX_DELAYED_PACKETS;
+
+            if (forward_count == PACKET_BURST)
+                break;
+        } else {
+            break; // queue is ordered by arrival, stop
+        }
+    }
+
+    if (forward_count > 0) {
+        rte_eth_tx_burst(egress_port, 0, to_forward, forward_count);
+    }
+}
+
+
+/*                 PACKET LOSS                       */
+
+static int packet_loss_initialized = 0;
+float packet_loss;  // Change from int to float
+
+void init_packet_loss(float packet_loss_percent) {
+	if (!packet_loss_initialized) {
+		srand(time(NULL)); // Seed with current time
+		packet_loss_initialized = 1;
+	}
+	packet_loss = packet_loss_percent;
+}
+
+int should_drop_packet() {
+	if (packet_loss <= 0.0){
+		return 0;
+	}
+	if (packet_loss >= 100.0){
+		return 1;
+	}
+	// Generate random number from 0-99
+	float random_val = (float)rand() / RAND_MAX * 100.0;
+
+	return (random_val < packet_loss);
+}
+
+void update_loss(float new_packet_loss) {
+    packet_loss = new_packet_loss;
+}
+
 static void process_packets(int ingress_port)
 {
     struct rte_mbuf *packets[PACKET_BURST];
     struct rte_mbuf *to_forward[PACKET_BURST];
+    uint16_t egress_port = (ingress_port == 0) ? 1 : 0; // assuming 2 ports: 0 and 1
     int queue_index = 0;
     int nb_packets;
     int forward_count = 0;
 
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    if (last_time.tv_sec == 0 && last_time.tv_nsec == 0) {
-        clock_gettime(CLOCK_MONOTONIC, &last_time);
-    }
-
-    // Calculate time difference in seconds
-    double elapsed_sec = (now.tv_sec - last_time.tv_sec) +
-                         (now.tv_nsec - last_time.tv_nsec) / 1e9;
-    
-    // Reset counter if more than 1s has passed
-    if (elapsed_sec >= 1.0) {
-        bytes_accumulated = 0;
-        last_time = now;
-    }
 
     nb_packets = rte_eth_rx_burst(ingress_port, queue_index, packets, PACKET_BURST);
     
-    pthread_mutex_lock(&topology_mutex);
-    uint64_t current_bandwidth = bandwidth;
-    int current_packet_loss = packet_loss;
-    int current_latency = latency;
-    int current_jitter = jitter;
-    pthread_mutex_unlock(&topology_mutex);
-    
     for (int i = 0; i < nb_packets; i++) {
-        struct rte_mbuf *pkt = packets[i];
+		struct rte_mbuf *pkt = packets[i];
+        uint16_t pkt_len = rte_pktmbuf_pkt_len(pkt);
 
-        if (current_bandwidth > 0) {
-            /* Simulate bandwidth shaping */
-            uint16_t pkt_len = rte_pktmbuf_pkt_len(pkt);
-
-            if (bytes_accumulated + pkt_len <= current_bandwidth) {
-                bytes_accumulated += pkt_len;
-            } else {
-                rte_pktmbuf_free(pkt); // Drop packet
-                continue;
-            }
+        if (should_drop_packet()) {
+            rte_pktmbuf_free(pkt);
+            continue;
         }
 
-        if (current_packet_loss > 0) {
-            /* Simulates packet loss by randomly deciding to drop a packet */
-            if ((float)rand() / RAND_MAX * 100.0 < current_packet_loss) {
-                rte_pktmbuf_free(pkt);
-                continue;
-            }
+        if (!process_bandwidth_limit(pkt_len)) {
+            rte_pktmbuf_free(pkt);
+            continue;
         }
 
-        if (current_jitter > 0) {
-            /* Simulate jitter (random delay up to jitter) */
-            int delay = rand() % (current_jitter + 1);
-            usleep(delay * 1000);
-        }
-
-        if (current_latency > 0) {
-            /* Simulate fixed latency */
-            usleep(current_latency * 1000);
-        }
-
-        to_forward[forward_count++] = pkt;
+        // Enqueue with latency + jitter
+        enqueue_with_delay(pkt);
     }
 
-    uint16_t egress_port = (ingress_port == 0) ? 1 : 0; // assuming 2 ports: 0 and 1
-
-    if (forward_count > 0) {
-        rte_eth_tx_burst(egress_port, queue_index, to_forward, forward_count);
-    }
+    // Try sending any packets whose time has expired
+    flush_ready_packets(egress_port);
 }
 
 int get_link_params(const char *src, const char *dst) {
@@ -187,19 +404,19 @@ int get_link_params(const char *src, const char *dst) {
     while (fgets(line, sizeof(line), fp)) {
         char src_line[32], dst_line[32];
         uint64_t bw;
-        int lat, jit, pl;
+        int lat, jit;
+        float pl;
 
-        int fields = sscanf(line, "%31s %31s %lu %d %d %d", src_line, dst_line, &bw, &lat, &jit, &pl);
+        int fields = sscanf(line, "%31s %31s %lu %d %d %f", src_line, dst_line, &bw, &lat, &jit, &pl);
         if (fields == 6) {
             if (strcmp(src_line, src) == 0 && strcmp(dst_line, dst) == 0) {
                 pthread_mutex_lock(&topology_mutex);
-                bandwidth = bw * 1024 * 1024 / 8;  // Convert Mbps to bytes per second
-                latency = lat;
-                jitter = jit;
-                packet_loss = pl;
+                update_bandwidth_bytes_per_sec(bw);
+                update_latency_and_jitter(lat, jit);
+                update_loss(pl);
                 pthread_mutex_unlock(&topology_mutex);
                 
-                DOCA_LOG_INFO("Updated parameters for connection %s->%s: bw: %lu Mbps, lat: %d ms, jit: %d ms, loss: %d%%",
+                DOCA_LOG_INFO("Updated parameters for connection %s->%s: bw: %lu Mbps, lat: %d ms, jit: %d ms, loss: %f%%",
                        src, dst, bw, lat, jit, pl);
                 found = 1;
                 break;
@@ -354,8 +571,14 @@ doca_error_t flow_rss_meta(int nb_queues, const char *src, const char *dst)
     // Set up signal handlers for graceful termination
     signal(SIGINT, signal_handler);  
     signal(SIGTERM, signal_handler);
-    
-    srand(time(NULL));
+
+    /* Set the Configuration of the Switch*/
+	init_working_bandwidth_limiter(0);
+	latency = 0;
+	jitter = 0;
+	init_packet_loss(0);
+
+	init_flow_table(); //used for per-packet jitter
     
     // Initialize mutex
     pthread_mutex_init(&topology_mutex, NULL);
@@ -445,7 +668,7 @@ doca_error_t flow_rss_meta(int nb_queues, const char *src, const char *dst)
     DOCA_LOG_INFO("BANDWIDTH: %lu bytes/sec", bandwidth);
     DOCA_LOG_INFO("LATENCY: %d ms", latency);
     DOCA_LOG_INFO("JITTER: %d ms", jitter);
-    DOCA_LOG_INFO("PACKET_LOSS: %d%%", packet_loss);
+    DOCA_LOG_INFO("PACKET_LOSS: %.2f%%", packet_loss);
     pthread_mutex_unlock(&topology_mutex);
 
     // Main processing loop
@@ -459,7 +682,7 @@ doca_error_t flow_rss_meta(int nb_queues, const char *src, const char *dst)
         time_t now = time(NULL);
         if (now - last_print >= 10) {  // Print every 10 seconds
             pthread_mutex_lock(&topology_mutex);
-            DOCA_LOG_INFO("CURRENT SETTINGS - BW: %lu bytes/sec, LAT: %d ms, JIT: %d ms, LOSS: %d%%", 
+            DOCA_LOG_INFO("CURRENT SETTINGS - BW: %lu bytes/sec, LAT: %d ms, JIT: %d ms, LOSS: %.2f%%", 
                          bandwidth, latency, jitter, packet_loss);
             pthread_mutex_unlock(&topology_mutex);
             last_print = now;
