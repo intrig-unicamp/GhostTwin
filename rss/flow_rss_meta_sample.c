@@ -337,15 +337,16 @@ static void process_packets(int ingress_port)
 		struct rte_mbuf *pkt = packets[i];
         uint16_t pkt_len = rte_pktmbuf_pkt_len(pkt);
 
+        if (!process_bandwidth_limit(pkt_len)) {
+            rte_pktmbuf_free(pkt);
+            continue;
+        }
+        
         if (should_drop_packet()) {
             rte_pktmbuf_free(pkt);
             continue;
         }
 
-        if (!process_bandwidth_limit(pkt_len)) {
-            rte_pktmbuf_free(pkt);
-            continue;
-        }
 
         // Enqueue with latency + jitter
         enqueue_with_delay(pkt);
